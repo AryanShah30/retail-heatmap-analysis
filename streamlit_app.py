@@ -6,7 +6,6 @@ import tempfile
 import random
 from collections import defaultdict
 import matplotlib.pyplot as plt
-import time
 
 st.set_page_config(page_title="Retail Heatmap Analytics", layout="wide")
 st.title("Retail: Customer Movement & Heatmap Analysis")
@@ -63,9 +62,9 @@ if uploaded_video:
     peak_frame = {"frame_idx": 0, "people": 0, "frame_image": None}
 
     st.info("Processing video...")
+    progress_text = st.empty()
+    frame_slot = st.empty()
 
-    # Preprocess frames into overlay_frames
-    overlay_frames = []
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -113,35 +112,27 @@ if uploaded_video:
         heat_color = cv2.applyColorMap(heat_norm, cv2.COLORMAP_JET)
         overlay = cv2.addWeighted(frame, 1 - OVERLAY_ALPHA, heat_color, OVERLAY_ALPHA, 0)
 
-        # Draw zones
         for z, (zx1, zy1, zx2, zy2) in ZONES.items():
             intensity = min(255, int(frame_zone_count[z] * 50))
             cv2.rectangle(overlay, (zx1, zy1), (zx2, zy2), (0, intensity, 255), 3)
 
-        overlay_frames.append(overlay)
+        frame_slot.image(overlay, channels="BGR")
+        progress_text.text(f"Processed frame {frame_idx}")
 
     cap.release()
     st.success("Processing completed!")
 
-    # Simulate live frames
-    st.subheader("Live Overlay Simulation")
-    frame_slot = st.empty()
-    for frame in overlay_frames:
-        frame_slot.image(frame, channels="BGR")
-        time.sleep(1/fps)
-
-    # Final heatmap
     heat_blur = cv2.GaussianBlur(heat, (GAUSS_KSIZE, GAUSS_KSIZE), 0)
     heat_norm = cv2.normalize(heat_blur, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     heat_color = cv2.applyColorMap(heat_norm, cv2.COLORMAP_JET)
     st.subheader("Final Heatmap")
     st.image(heat_color, channels="BGR")
 
-    # Statistics
     st.subheader("Statistics")
     st.markdown(f"- Total unique people detected: **{len(track_seen)}**")
     st.markdown(f"- Frames processed: **{frame_idx}**")
-    st.markdown(f"- Peak occupancy in any frame: **{peak_frame['people']}**")
+    st.markdown(f"- Peak occupancy in any frame: **{peak_frame['people']}** (unique IDs)")
+    st.write("")
     st.markdown(f"- Frame with most people: **{peak_frame['frame_idx']}**")
     st.markdown(f"- Average occupancy per frame: **{np.mean(occupancy_per_frame):.2f}**")
 
@@ -150,6 +141,7 @@ if uploaded_video:
         st.image(peak_frame["frame_image"], channels="BGR")
 
     for z in ZONES:
+        st.write("")
         st.markdown(f"- {z} peak occupancy: {max(zone_occupancy[z], default=0)}, avg: {np.mean(zone_occupancy[z]):.2f}")
         occupancy_pct = (np.count_nonzero(zone_occupancy[z]) / len(zone_occupancy[z])) * 100
         st.markdown(f"- {z} occupancy percentage of frames: **{occupancy_pct:.1f}%**")
@@ -157,7 +149,6 @@ if uploaded_video:
         st.markdown(f"- {z} average dwell time per person: **{avg_dwell_sec:.2f} seconds**")
         st.markdown(f"- {z} cumulative heat intensity: **{heat_intensity_zone[z]:.1f}**")
 
-        # Proof: occupancy over frames
         fig, ax = plt.subplots(figsize=(6,2))
         ax.plot(zone_occupancy[z], label=f"{z} occupancy")
         ax.set_xlabel("Frame")
