@@ -1,5 +1,5 @@
 streamlit==1.49.1
-opencv-python
 numpy
-ultralytics
 matplotlib
+ultralytics
+opencv-python-headless
