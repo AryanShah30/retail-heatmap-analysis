@@ -18,12 +18,14 @@ if uploaded_video:
 
     MODEL_WEIGHTS = "yolov8n.pt"
     CONF_THRESH = 0.3
+    TRACKER_CONFIG = "bytetrack.yaml"
     KERNEL_RADIUS = 25
     GAUSS_KSIZE = 51
     HEAT_DECAY = 0.98
     OVERLAY_ALPHA = 0.5
     CLASSES = [0]
-    frame_skip = 2
+    frame_skip = 1
+    CONGESTION_THRESHOLD = 1.2e-4  # people per pixel threshold to flag congestion
 
     def generate_random_zones(frame_width, frame_height, num_zones=2, min_size_ratio=0.15, max_size_ratio=0.35):
         zones = {}
@@ -47,6 +49,8 @@ if uploaded_video:
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = int(cap.get(cv2.CAP_PROP_FPS)) or 25
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    cap.release()
 
     ZONES = generate_random_zones(width, height, num_zones=2)
 
@@ -58,42 +62,61 @@ if uploaded_video:
     zone_occupancy = {z: [] for z in ZONES}
     dwell_frames = defaultdict(lambda: defaultdict(int))
     heat_intensity_zone = {z: 0.0 for z in ZONES}
+    zone_density_history = {z: [] for z in ZONES}
+    zone_congestion_frames = {z: 0 for z in ZONES}
 
     peak_frame = {"frame_idx": 0, "people": 0, "frame_image": None}
 
     st.info("Processing video...")
     progress_text = st.empty()
     frame_slot = st.empty()
+    congestion_banner = st.empty()
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    try:
+        results_stream = model.track(
+            source=video_path,
+            stream=True,
+            tracker=TRACKER_CONFIG,
+            persist=True,
+            classes=CLASSES,
+            conf=CONF_THRESH,
+            verbose=False,
+        )
+    except Exception as err:
+        st.error(f"Tracking initialization failed: {err}")
+        st.stop()
+
+    for result in results_stream:
         frame_idx += 1
         if frame_idx % frame_skip != 0:
             continue
 
-        results = model.predict(frame, classes=CLASSES, conf=CONF_THRESH)
+        frame = result.orig_img.copy()
         frame_ids = set()
         frame_zone_count = {z: 0 for z in ZONES}
+        congested_zones = []
 
-        if results and results[0].boxes is not None:
-            boxes = results[0].boxes.xyxy.cpu().numpy().astype(int)
-            ids = results[0].boxes.id.cpu().numpy() if results[0].boxes.id is not None else np.arange(len(boxes))
+        boxes_tensor = getattr(result, "boxes", None)
+        if boxes_tensor is not None and boxes_tensor.xyxy is not None:
+            boxes = boxes_tensor.xyxy.cpu().numpy().astype(int)
+            if boxes_tensor.id is not None:
+                ids = boxes_tensor.id.cpu().numpy().astype(int)
+            else:
+                ids = np.arange(len(boxes))
 
             frame_ids.update(ids)
-            track_seen.update(ids)
+            track_seen.update(int(tid) for tid in ids)
 
             for (x1, y1, x2, y2), tid in zip(boxes, ids):
                 cx, cy = (x1 + x2)//2, (y1 + y2)//2
                 cv2.circle(heat, (cx, cy), KERNEL_RADIUS, 1, -1)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (60, 220, 60), 2)
-                cv2.putText(frame, f"ID {tid}", (x1, max(0, y1-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (60, 220, 60), 2)
+                cv2.putText(frame, f"ID {int(tid)}", (x1, max(0, y1-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (60, 220, 60), 2)
 
                 for z, (zx1, zy1, zx2, zy2) in ZONES.items():
                     if zx1 <= cx <= zx2 and zy1 <= cy <= zy2:
                         frame_zone_count[z] += 1
-                        dwell_frames[tid][z] += 1
+                        dwell_frames[int(tid)][z] += 1
 
         occupancy_per_frame.append(len(frame_ids))
 
@@ -105,6 +128,13 @@ if uploaded_video:
         for z in ZONES:
             zone_occupancy[z].append(frame_zone_count[z])
             heat_intensity_zone[z] += frame_zone_count[z]
+            zx1, zy1, zx2, zy2 = ZONES[z]
+            zone_area = max(1, (zx2 - zx1) * (zy2 - zy1))
+            density = frame_zone_count[z] / zone_area
+            zone_density_history[z].append(density)
+            if density >= CONGESTION_THRESHOLD:
+                zone_congestion_frames[z] += 1
+                congested_zones.append(z)
 
         heat *= HEAT_DECAY
         heat_blur = cv2.GaussianBlur(heat, (GAUSS_KSIZE, GAUSS_KSIZE), 0)
@@ -114,12 +144,31 @@ if uploaded_video:
 
         for z, (zx1, zy1, zx2, zy2) in ZONES.items():
             intensity = min(255, int(frame_zone_count[z] * 50))
-            cv2.rectangle(overlay, (zx1, zy1), (zx2, zy2), (0, intensity, 255), 3)
+            color = (0, intensity, 255)
+            if z in congested_zones:
+                color = (0, 0, 255)
+                cv2.putText(
+                    overlay,
+                    "Queue risk",
+                    (zx1 + 5, min(height - 10, zy1 + 25)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    color,
+                    2,
+                )
+            cv2.rectangle(overlay, (zx1, zy1), (zx2, zy2), color, 3)
 
         frame_slot.image(overlay, channels="BGR")
-        progress_text.text(f"Processed frame {frame_idx}")
+        if congested_zones:
+            congestion_banner.warning(f"High density in: {', '.join(congested_zones)}")
+        else:
+            congestion_banner.empty()
 
-    cap.release()
+        if total_frames:
+            progress_text.text(f"Processed frame {frame_idx}/{total_frames}")
+        else:
+            progress_text.text(f"Processed frame {frame_idx}")
+
     st.success("Processing completed!")
 
     heat_blur = cv2.GaussianBlur(heat, (GAUSS_KSIZE, GAUSS_KSIZE), 0)
@@ -148,6 +197,8 @@ if uploaded_video:
         avg_dwell_sec = (sum(dwell_frames[tid][z] for tid in dwell_frames) / fps) / len(dwell_frames) if dwell_frames else 0
         st.markdown(f"- {z} average dwell time per person: **{avg_dwell_sec:.2f} seconds**")
         st.markdown(f"- {z} cumulative heat intensity: **{heat_intensity_zone[z]:.1f}**")
+        congested_pct = (zone_congestion_frames[z] / len(zone_density_history[z]) * 100) if zone_density_history[z] else 0
+        st.markdown(f"- {z} congestion frames: **{zone_congestion_frames[z]} ({congested_pct:.1f}% of processed frames)**")
 
         fig, ax = plt.subplots(figsize=(6,2))
         ax.plot(zone_occupancy[z], label=f"{z} occupancy")
